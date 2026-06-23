@@ -19,8 +19,9 @@ Graph flow:
     → [reject]        → END
 """
 
+import os
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from state import GraphState
 from agents.guardrail import guardrail_node
@@ -137,8 +138,11 @@ def build_graph():
     # Assembler → done
     builder.add_edge("assembler", END)
 
-    # MemorySaver enables interrupt() / resume pattern
-    memory = MemorySaver()
+    db_path = os.path.join(os.path.dirname(__file__), "data", "checkpoints.db")
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(db_path, check_same_thread=False)
+    memory = SqliteSaver(conn)
     return builder.compile(
         checkpointer=memory,
         interrupt_before=["hitl_review", "low_fit_warning"],
