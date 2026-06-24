@@ -4,13 +4,15 @@
 **Repository:** `https://github.com/Sam-wiz/ML-capstone-project` \
 **Team size:** 5 members
 
-## Samrudh — State Schema & Graph Architecture
+---
+
+## Samrudh — State Schema, Graph Architecture & Persistence
 
 **Files owned:** `state.py`, `graph.py`
 
 ### What I built
 
-I designed the LangGraph graph that every other agent plugs into, and the shared state object that flows through it.
+I designed the LangGraph graph that every other agent plugs into, the shared state object that flows through it, and the persistent checkpoint system.
 
 **`state.py`**
 
@@ -34,19 +36,23 @@ I implemented the full `StateGraph`:
   - `route_after_fit_score` — `low_fit_warning` if score < 40, else `cv_tailor`
   - `route_after_low_fit_warning` — `cv_tailor` if human approves, `END` if rejects
   - `route_after_hitl_review` — `assembler` if approve/edit, `END` if reject
-- Configured `MemorySaver` as the checkpointer — this is what enables the interrupt/resume HITL pattern
-- Set `interrupt_before=["hitl_review", "low_fit_warning"]` — the graph persists state to the checkpointer before pausing at these nodes, so if the UI crashes during review, state is not lost
+- Migrated from `MemorySaver` to `SqliteSaver` (`langgraph-checkpoint-sqlite`) for durable persistence — checkpoints now survive server restarts, so in-progress HITL reviews are never lost
+- Set `interrupt_before=["hitl_review", "low_fit_warning"]` — the graph persists state to the checkpointer before pausing at these nodes
 
-**Design decision I own:** I interrupt *before* the HITL nodes rather than inside them. This means state is checkpointed before any human-facing logic runs. Resuming with `graph.stream(None, config)` after `update_state()` re-enters cleanly from the saved checkpoint.
+**Design decisions I own:**
+- I interrupt *before* the HITL nodes rather than inside them. State is checkpointed before any human-facing logic runs. Resuming with `graph.stream(None, config)` after `update_state()` re-enters cleanly from the saved checkpoint.
+- SqliteSaver is opened with a persistent `sqlite3.connect(..., check_same_thread=False)` connection at module load time, so all Streamlit reruns share the same connection without re-opening the database.
 
 
-## Pranav — Guardrail Node & Fit Scorer Agent
+---
 
-**Files owned:** `agents/guardrail.py`, `agents/fit_scorer.py`
+## Pranav — Guardrail Node, Fit Scorer & Interview Prep Agent
+
+**Files owned:** `agents/guardrail.py`, `agents/fit_scorer.py`, `agents/interview_prep.py`
 
 ### What I built
 
-I built the first two nodes in the pipeline: the guardrail that protects the system before any LLM call, and the Fit Scorer that produces the numerical assessment everything downstream is built around.
+I built the first two nodes in the pipeline and the post-pipeline Interview Prep agent.
 
 **`agents/guardrail.py`**
 
@@ -73,51 +79,76 @@ The most analytically complex agent:
 
 The fallback I wrote: if the LLM call or JSON parse fails, the agent creates a default `FitScoreOutput` with score=50, `"moderate_fit"`, and logs the error to `agent_log`. The graph continues — it never crashes silently or hangs.
 
-**Design decision I own:** I use two separate `extract_keywords` tool calls (one on JD, one on resume) rather than one combined call. This gives the scoring prompt a clean, structured diff — matched keywords and missing keywords as separate lists — rather than asking the LLM to do the comparison itself in natural language. Structured input → more reliable scoring output.
+**`agents/interview_prep.py`** *(new)*
+
+A post-pipeline agent that generates 12 tailored interview questions from the JD and resume after the user approves their application package. Question breakdown:
+
+- 3 behavioural (STAR format, tied to specific JD requirements)
+- 3 technical (exact tech stack from the JD — not generic questions)
+- 2 situational (hypothetical role-specific scenarios)
+- 2 role-specific (culture fit, ownership mindset)
+- 1 "why this company / role"
+- 1 opener ("tell me about yourself")
+
+Each question carries: `difficulty` (easy/medium/hard), `talking_points` naming specific projects and metrics from the candidate's own resume, `sample_answer_structure`, and a concise coaching `tip`. The output also includes `red_flags_to_avoid` — 3 common mistakes specific to this role type.
+
+**Design decisions I own:**
+- Two separate keyword tool calls (JD and resume) give the scoring prompt a clean structured diff rather than asking the LLM to compare in natural language.
+- Interview questions reference actual resume artifacts (project names, companies, tools used) rather than being generic — this is enforced in the system prompt and validated at runtime.
 
 
-## Rushabh — CV Tailor Agent & Tools Module
+---
 
-**Files owned:** `agents/cv_tailor.py`, `tools/tools.py`
+## Rushabh — CV Tailor Agent, Tools Module & Resume PDF Generation
+
+**Files owned:** `agents/cv_tailor.py`, `tools/tools.py`, `tools/pdf_parser.py`, `tools/resume_pdf_writer.py`
 
 ### What I built
 
-I built Agent 2 and the entire tools module that all three agents depend on.
+I built Agent 2, the entire tools module that all agents depend on, and the two-step resume PDF pipeline.
 
 **`tools/tools.py`**
 
 Three `@tool`-decorated functions:
 
-`extract_keywords(text: str) → dict`
-Rule-based extractor using pattern matching against lists of known technical skills, soft skills, qualification keywords, and regex for uppercase acronyms. Returns four categorised lists. Entirely deterministic — no LLM call, no variability, no cost. I chose rule-based deliberately: asking the LLM to extract keywords inside the scoring prompt increases hallucination on that sub-task. Separating it into a deterministic tool keeps the main prompt focused on reasoning.
+`extract_keywords(text: str) → dict` — Rule-based extractor using pattern matching against lists of known technical skills, soft skills, qualification keywords, and regex for uppercase acronyms. Returns four categorised lists. Entirely deterministic — no LLM call, no variability, no cost. Keeping this rule-based prevents hallucination on keyword extraction from contaminating the scoring prompt.
 
-`rewrite_bullets(original_bullets, target_keywords, role_title) → list`
-Takes resume bullets and the missing keywords from `FitScoreOutput`. Returns per-bullet dicts with the original bullet, a list of keywords to weave in, and a hint note. This is used by Agent 2 as structured hints to the LLM — not as finished rewrites. The LLM synthesises from these hints, which is more reliable than asking it to freestyle. The tool itself never changes the bullet text.
+`rewrite_bullets(original_bullets, target_keywords, role_title) → list` — Takes resume bullets and the missing keywords from `FitScoreOutput`. Returns per-bullet dicts with the original bullet, keywords to weave in, and a hint note. These are *suggestions* to the LLM, not finished rewrites — the LLM synthesises from them, which is more reliable than freeform generation.
 
-`validate_cover_letter(cover_letter_text: str) → dict`
-Quality gate used by Agent 3. Checks: word count (150–500 range), presence of a salutation (`"dear"`), presence of a closing (`"sincerely"`, `"regards"`, `"thank you"`). Returns `passed: bool` and a list of issues. If `passed = False`, Agent 3 appends a correction prompt and retries.
+`validate_cover_letter(cover_letter_text: str) → dict` — Quality gate used by Agent 3. Checks: word count (150–500 range), salutation, closing. Returns `passed: bool` and a list of issues.
 
 **`agents/cv_tailor.py`**
 
-Agent 2 workflow:
+Agent 2 workflow: extracts bullet candidates from the resume using line heuristics, calls `rewrite_bullets` with the top 6 bullets and missing keywords, constructs a hint-guided LLM prompt, parses into `TailoredCVOutput`. The system prompt enforces that the agent never fabricates experience — only surfaces existing content using JD keywords.
 
-1. Extracts raw bullet candidates from the resume text using line heuristics (lines with bullet chars or capitalized lines over 40 chars)
-2. Calls `rewrite_bullets` with the top 6 bullets and the missing keywords from Agent 1's output
-3. Constructs an LLM prompt with the tool's suggestions as structured hints
-4. Parses into `TailoredCVOutput`
+**`tools/pdf_parser.py`** *(new)*
 
-The most important constraint in the system prompt: **never fabricate experience**. The agent is instructed to rewrite existing content to surface relevance using JD keywords, not to invent skills or achievements. The tool's keyword hints reinforce this — they tell the LLM *which* keywords to weave in, not to make up new bullets.
+PDF resume parser using `pdfplumber`. Handles multi-column layouts (which PyPDF2 fails on) using `extract_text(x_tolerance=3, y_tolerance=3)`. Accepts raw file bytes (from `st.file_uploader`) and returns clean plain text.
 
-**Design decision I own:** The `rewrite_bullets` tool returns *suggestions*, not finished bullets. The LLM agent decides which suggestions to apply and how. This keeps tool output deterministic and auditable, while leaving creative synthesis to the LLM — the right division of labour.
+**`tools/resume_pdf_writer.py`** *(new)*
+
+A two-step resume update pipeline:
+
+1. `generate_resume_structured()` — Single `gpt-4o-mini` call: takes the original resume text and the tailored CV output, applies minimal targeted edits (keyword-adding, summary rewrite), and returns a complete structured JSON representation of the updated resume. The LLM prompt uses `<placeholder>` format (not `—` separators) to prevent the model from copying schema markup into values.
+
+2. `render_resume_html()` / `render_resume_pdf_from_data()` — Deterministic renderers that take the structured JSON and produce either HTML (for in-app preview with a "Generated by Job Application Assistant" watermark footer) or a clean PDF via `fpdf2` (watermark omitted for download). Layout constants are tuned to a single page: tight margins (15mm L/R, 12mm top, 10mm bottom), Times Bold for name/headings, line height 4.5mm.
+
+A `_s()` helper handles `fpdf2`'s latin-1 encoding constraint by substituting `•→-`, `–→-`, `—→-`, `→→->`, and smart quotes before encoding.
+
+**Design decisions I own:**
+- LLM edits the whole resume as a unit rather than patching individual sections — this preserves formatting continuity and avoids awkward transitions.
+- `resume_structured_data` is cached in `st.session_state` so the LLM is called exactly once when entering the Done stage, not on every Streamlit rerun.
 
 
-## Navneet — Cover Letter Writer Agent & RAG Pipeline
+---
 
-**Files owned:** `agents/cover_letter_writer.py`, `rag/rag_setup.py`
+## Navneet — Cover Letter Writer, RAG Pipeline & Job Finder
+
+**Files owned:** `agents/cover_letter_writer.py`, `rag/rag_setup.py`, `agents/job_finder.py`
 
 ### What I built
 
-I built Agent 3 and the ChromaDB RAG pipeline that grounds both the Fit Scorer and Cover Letter Writer in factual domain knowledge.
+I built Agent 3, the ChromaDB RAG pipeline that grounds both the Fit Scorer and Cover Letter Writer in factual domain knowledge, and the multi-source job search system.
 
 **`rag/rag_setup.py`**
 
@@ -133,66 +164,85 @@ I set up a local ChromaDB vector store with 7 embedded knowledge documents:
 | Startup vs enterprise application strategy | `general` |
 | Marketing and growth role requirements | `marketing` |
 
-I embedded all documents inline as `Document` objects — the project runs immediately after `pip install` with no external files required.
-
-Technical setup:
-- **Embedding:** `text-embedding-3-small` — cheaper than `ada-002`, comparable quality for retrieval
-- **Chunking:** `RecursiveCharacterTextSplitter`, 400 token chunks, 50 token overlap
-- **Persistence:** `persist_directory="./chroma_db"` — first run embeds and saves; subsequent runs load from disk. I implemented a `_retriever` module-level singleton with an `os.path.exists()` check to avoid re-embedding on every invocation.
-- **Retrieval:** similarity search, k=3 chunks per query
-
-`retrieve_context(query)` is the public function. It initialises the retriever on first call, runs the query, and returns the top-3 chunks joined as a single string.
+Technical setup: `text-embedding-3-small` embeddings, `RecursiveCharacterTextSplitter` (400 token chunks, 50 token overlap), `persist_directory="./chroma_db"` for disk persistence (first run embeds and saves; subsequent runs load from disk, `os.path.exists()` check prevents re-embedding).
 
 **`agents/cover_letter_writer.py`**
 
-Agent 3 makes two RAG calls before writing:
-1. `retrieve_context("cover letter best practices writing tips")` — structural and stylistic guidance
-2. `retrieve_context(f"{role_title} key skills requirements")` — industry-specific content
+Agent 3 makes two RAG calls before writing — best practices context and industry-specific content separately, rather than one combined query that mixes relevance. Uses `FitScoreOutput.strengths`, `TailoredCVOutput.summary`, and the top 3 tailored bullets as evidence. `temperature=0.5` (higher than other agents — cover letters need natural prose). Self-correction loop: calls `validate_cover_letter` after generation; if it fails, retries with a correction prompt appending the specific issues.
 
-It then builds a prompt using `FitScoreOutput.strengths`, `TailoredCVOutput.summary`, and the top 3 tailored bullets as evidence — so the letter directly references the candidate's strongest points.
+**`agents/job_finder.py`** *(new)*
 
-I set `temperature=0.5` — higher than the other agents because cover letters benefit from natural-sounding, varied prose rather than deterministic output.
+A dual-source job search system:
 
-**Self-correction loop I implemented:** After generation, the agent calls `validate_cover_letter`. If it fails, the agent appends a correction prompt identifying the specific issues and calls the LLM again. If the retry also fails, the original draft is kept — the graph never hangs.
+*Greenhouse (primary source):* Rather than relying on search-engine discovery (which is fragile and rate-limited), I maintain a curated list of 40+ verified Greenhouse board slugs (Stripe, Anthropic, Figma, Vercel, Pinterest, Lyft, Coinbase, Databricks, etc.). Search runs in two parallel phases:
 
-**Design decision I own:** Two separate RAG queries (best practices + industry context) rather than one combined query. A combined query like "cover letter best practices software engineering" returns a mix that competes for relevance. Two queries give the model clean, focused context blocks for different purposes.
+1. **Board-list phase** — concurrent `ThreadPoolExecutor(max_workers=12)` fetches all boards' job lists, filters by keyword relevance (token-overlap scoring against title + location), deduplicates by job ID
+2. **Detail phase** — concurrent `ThreadPoolExecutor(max_workers=8)` fetches full descriptions + question lists for the top candidates
+
+This returns 8+ real, verified job listings with live descriptions in ~3–5 seconds. Every Greenhouse listing carries `greenhouse_board` and `greenhouse_job_id` for downstream use.
+
+*DuckDuckGo (secondary source):* Falls back to LLM-enriched listings when DDG responds. Uses `gpt-4o-mini` to synthesise 4 realistic listings from search snippets. Graceful: if DDG returns nothing (rate-limited, renamed package), the LLM generates plausible listings anyway.
+
+Every listing has a `source` field (`"greenhouse"` or `"duckduckgo"`) shown as a badge in the UI.
+
+**Design decisions I own:**
+- Curated board list vs. dynamic discovery: DDG's `site:boards.greenhouse.io` search returns 0 results consistently (rate-limited + package deprecated). A maintained list of 40+ top tech companies is more reliable and doesn't depend on a third-party search index.
+- Two-phase parallel fetch: board-list fetches are cheap (small JSON); detail fetches are expensive (full HTML description). Running them in separate pools avoids wasting detail-fetch capacity on jobs that won't make the relevance cut.
 
 
-## Ayush — HITL Nodes, Assembler, Streamlit UI & Evaluations
+---
 
-**Files owned:** `agents/hitl_and_assembler.py`, `app.py`, `main.py`, `evals/run_evals.py`
+## Ayush — HITL Nodes, Assembler, Streamlit UI, Auth & Application Tracker
+
+**Files owned:** `agents/hitl_and_assembler.py`, `app.py`, `main.py`, `evals/run_evals.py`, `auth/auth.py`, `db/database.py`
 
 ### What I built
 
-I built the human-in-the-loop layer, the final output assembler, both interfaces (Streamlit and CLI), and the full evaluation suite.
+I built the human-in-the-loop layer, the final output assembler, both interfaces, the evaluation suite, the JWT authentication system, and the application tracker database.
 
 **`agents/hitl_and_assembler.py`**
 
-Three nodes:
+`low_fit_warning_node` — Fires when `fit_score < 40`. Prepares display state for the UI. The graph is already interrupted by `interrupt_before` — this node just writes the warning payload to state.
 
-`low_fit_warning_node` — Fires when `fit_score < 40`. Sets `awaiting_human = True` and writes a warning message (score, recommendation, gap list) to `guardrail_message` for the UI to surface. The graph is already interrupted at this point by `interrupt_before` — this node just prepares the display state.
+`hitl_review_node` — The main review gate. Intentionally thin: sets `awaiting_human = True` and logs the pause. All review logic lives in the UI — separation of graph state from UI state is deliberate.
 
-`hitl_review_node` — The main review gate. Sets `awaiting_human = True` and logs the pause. All actual review logic lives in the UI — this node is intentionally thin. The separation between graph state and UI state is deliberate: the graph doesn't care *how* the human reviews, only *what decision* they return.
+`assembler_node` — Reads `human_feedback`: if the human provided edited CV or cover letter text, those replace the agent-generated versions. Assembles everything into a single markdown document with sections for fit analysis, tailored CV, and cover letter. Resets `awaiting_human = False`.
 
-`assembler_node` — Runs after HITL approval. Reads `human_feedback` from state: if the human provided edited CV or cover letter text, those replace the agent-generated versions. Assembles everything into a single markdown document with sections for fit analysis (score, strengths, gaps, keyword match), tailored CV, and cover letter. Resets `awaiting_human = False`.
+**`app.py` — Streamlit UI** *(significantly expanded)*
 
-**`app.py` — Streamlit UI**
+A 5-stage state machine (`input → running → low_fit → review → done → aborted`) across three pages:
 
-A 5-stage state machine using `st.session_state.stage`:
+- **Job Finder** — Search results from both sources with source badges (Greenhouse vs DuckDuckGo), expand-to-details, one-click "Tailor for this role" that pre-fills the Tailor page
+- **Tailor Application** — Step tracker, resume PDF upload (bytes cached in session), pipeline runner, HITL review with editable fields, done stage with three tabs (Application Package, Updated Resume, Interview Prep)
+- **My Applications** — Application tracker (see below)
 
-| Stage | What the user sees | Transition |
-|-------|-------------------|-----------|
-| `input` | JD + resume text areas | Click "Generate" |
-| `low_fit` | Score, gaps, proceed/abort buttons | Button click |
-| `review` | Full agent outputs, editable fields, 3 buttons | Button click |
-| `done` | Final package + download button | — |
-| `aborted` | Abort message + reset button | — |
+The Done stage runs two LLM calls (resume structuring and interview prep) cached in session state so Streamlit reruns don't re-call the LLM.
 
-The HITL resume pattern: after the user clicks a decision button, I call `graph.update_state(config, {"human_feedback": feedback.model_dump(), "awaiting_human": False})`, then `graph.stream(None, config, stream_mode="values")`. The `None` input tells LangGraph to resume from the checkpoint rather than start fresh.
+**`auth/auth.py`** *(new)*
+
+JWT authentication:
+- `bcrypt` for password hashing (salt rounds default, `checkpw` for constant-time comparison)
+- `PyJWT` for token encoding/decoding — `sub` stored as string (JWT spec) and cast back to `int` on decode
+- 7-day token expiry; `JWT_SECRET` read from env with a hardcoded dev fallback
+- `register()` / `login()` return `(bool, message)` / `(token | None, message)` tuples — no exceptions bubble to the UI
+
+**`db/database.py`** *(new)*
+
+SQLite schema with two tables:
+
+`users` — `id`, `email` (unique), `password_hash`, `name`, `created_at`
+
+`applications` — `id`, `user_id` (FK → users, cascade delete), `job_title`, `company`, `location`, `status` (CHECK constraint: `Applied / Screening / Interview / Offer / Rejected`), `source`, `greenhouse_board`, `greenhouse_job_id`, `fit_score`, `job_description`, `notes`, `applied_at`, `updated_at`. An `AFTER UPDATE` trigger keeps `updated_at` in sync automatically.
+
+Helper functions: `init_db()`, `create_user()`, `get_user_by_email()`, `get_user_by_id()`, `add_application()`, `get_applications()`, `update_application_status()`, `delete_application()`.
+
+The tracker page shows per-status counts (Applied / Screening / Interview / Offer / Rejected), inline status updates with notes, delete, and a manual entry form for roles applied to outside the app.
+
+Applications are auto-added to the tracker when the user approves a tailoring pipeline (with fit score) or applies via an external link.
 
 **`main.py` — CLI runner**
 
-Terminal-based HITL loop using `input()`. Reads graph state after each interrupt, prints the agent outputs, prompts for a decision, calls `graph.update_state()` and `graph.stream(None, config)` to resume. Saves the final package to `output_package.md`.
+Terminal-based HITL loop using `input()`. Reads graph state after each interrupt, prints agent outputs, prompts for a decision, calls `graph.update_state()` and `graph.stream(None, config)` to resume. Saves the final package to `output_package.md`.
 
 **`evals/run_evals.py` — 5 evaluation cases**
 
@@ -206,14 +256,19 @@ Terminal-based HITL loop using `input()`. Reads graph state after each interrupt
 
 Each eval that reaches HITL auto-approves using `HumanFeedback(decision="approve")` injected via `graph.update_state()` — so the full pipeline can run unattended in CI.
 
-**Design decision I own:** I keep Streamlit's `stage` variable separate from LangGraph's `awaiting_human` field. The LangGraph field records *where the graph paused*. The Streamlit field controls *which screen to render*. They sometimes mirror each other but are independently managed — a Streamlit rerun doesn't accidentally trigger a graph resume.
+**Design decisions I own:**
+- Streamlit's `stage` variable is separate from LangGraph's `awaiting_human` field. The LangGraph field records *where the graph paused*. The Streamlit field controls *which screen to render*. A Streamlit rerun doesn't accidentally trigger a graph resume.
+- Auth uses a button-toggle pattern (`st.session_state.auth_mode`) instead of `st.tabs()` inside columns — Streamlit's widget state machine behaves unreliably with tabs nested inside column layouts, causing blank-page rendering bugs.
+
+
+---
 
 ## Contribution Summary
 
 | Member | Files | Rubric areas |
 |--------|-------|-------------|
-| Samrudh | `state.py`, `graph.py` | LangGraph implementation · structured outputs · routing/branching · state management |
-| Pranav | `agents/guardrail.py`, `agents/fit_scorer.py` | Guardrails · Agent 1 · conditional routing · tool use |
-| Rushabh | `agents/cv_tailor.py`, `tools/tools.py` | Agent 2 · tool use · structured outputs |
-| Navneet | `agents/cover_letter_writer.py`, `rag/rag_setup.py` | Agent 3 · RAG/knowledge grounding |
-| Ayush | `agents/hitl_and_assembler.py` · `app.py` · `main.py` · `evals/run_evals.py` | HITL · demo quality · evaluation · debugging/observability |
+| Samrudh | `state.py`, `graph.py` | LangGraph graph · Pydantic structured outputs · routing/branching · SqliteSaver persistence |
+| Pranav | `agents/guardrail.py`, `agents/fit_scorer.py`, `agents/interview_prep.py` | Guardrails · Fit Scorer · Interview Prep agent · tool use |
+| Rushabh | `agents/cv_tailor.py`, `tools/tools.py`, `tools/pdf_parser.py`, `tools/resume_pdf_writer.py` | CV Tailor · tools module · PDF parsing · LLM-driven resume PDF generation |
+| Navneet | `agents/cover_letter_writer.py`, `rag/rag_setup.py`, `agents/job_finder.py` | Cover Letter writer · RAG/ChromaDB · Greenhouse + DuckDuckGo job search |
+| Ayush | `agents/hitl_and_assembler.py`, `app.py`, `main.py`, `evals/run_evals.py`, `auth/auth.py`, `db/database.py` | HITL · assembler · Streamlit UI · JWT auth · application tracker · evaluations |
